@@ -1,13 +1,14 @@
 {
   "expo": {
-    "name": ".expo-scaffold",
-    "slug": ".expo-scaffold",
+    "name": "Design Engineering",
+    "slug": "design-engineering",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "in.station91.designengineering"
     },
     "android": {
       "adaptiveIcon": {
@@ -20,6 +21,9 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      "expo-status-bar"
+    ]
   }
 }
