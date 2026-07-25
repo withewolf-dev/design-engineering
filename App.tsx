@@ -2,12 +2,14 @@ import { StatusBar } from 'expo-status-bar';
 import { type ReactNode } from 'react';
 import { SafeAreaView, ScrollView, StyleSheet, Text, View } from 'react-native';
 import AnimatedGradient from './AnimatedGradient';
+import AudiencePyramid from './AudiencePyramid';
 import CoachTaskCard from './CoachTaskCard';
 import CurrencyFormatting from './CurrencyFormatting';
 import HorizonGlow from './HorizonGlow';
 import ReferralChart from './ReferralChart';
 import SegmentedTabs from './SegmentedTabs';
 import StreakCard from './StreakCard';
+import SunriseDone from './SunriseDone';
 import SunsetCard from './SunsetCard';
 import TasksCard from './TasksCard';
 
@@ -54,6 +56,10 @@ export default function App() {
         <Text style={styles.h1}>Component Library</Text>
         <Text style={styles.sub}>Everything we've built — nothing gets removed.</Text>
 
+        <Frame title="Audience Pyramid" tone="dark" fill>
+          <AudiencePyramid />
+        </Frame>
+
         <Frame title="Coach Task Card">
           <CoachTaskCard />
         </Frame>
@@ -76,6 +82,10 @@ export default function App() {
 
         <Frame title="Sunset Card">
           <SunsetCard />
+        </Frame>
+
+        <Frame title="Sunrise — Day Complete" tone="dark" fill>
+          <SunriseDone />
         </Frame>
 
         <Frame title="Horizon Glow" tone="dark" fill>
