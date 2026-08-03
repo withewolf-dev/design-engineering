@@ -20,6 +20,7 @@ import AnimatedGradient from './AnimatedGradient';
 import AudiencePyramid from './AudiencePyramid';
 import ChargeWindow from './ChargeWindow';
 import CoachTaskCard from './CoachTaskCard';
+import CoffeeOrder from './CoffeeOrder';
 import CurrencyFormatting from './CurrencyFormatting';
 import HorizonGlow from './HorizonGlow';
 import ReferralChart from './ReferralChart';
@@ -89,10 +90,14 @@ export default function App() {
   // length of that gesture — otherwise the page slides out from under the finger
   const [locked, setLocked] = useState(false);
 
-  // full-screen routes. One shared value drives both layers of the push, so
-  // the gallery sliding back and the screen arriving can never drift apart.
-  const [route, setRoute] = useState<'gallery' | 'seats'>('gallery');
-  const push = useSharedValue(0);
+  // full-screen routes. Each route owns its own progress value — sharing one
+  // across two independently-openable screens risks a race if a user taps
+  // between them before an animation settles (one screen's exit can get
+  // overwritten by the other's entrance mid-flight, leaving it stuck mounted
+  // underneath). The gallery's own recede reads whichever is further along.
+  const [route, setRoute] = useState<'gallery' | 'seats' | 'coffee'>('gallery');
+  const seatsPush = useSharedValue(0);
+  const coffeePush = useSharedValue(0);
 
   // The trailer is owned here, where nothing ever unmounts. Skia's useVideo
   // disposes its native player on unmount while the frame callback is still
@@ -102,10 +107,13 @@ export default function App() {
   const reduced = useReducedMotion();
   const w = Dimensions.get('window').width;
 
-  const galleryStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: reduced ? 0 : -w * 0.22 * push.value }],
-    opacity: 1 - 0.45 * push.value,
-  }));
+  const galleryStyle = useAnimatedStyle(() => {
+    const p = Math.max(seatsPush.value, coffeePush.value);
+    return {
+      transform: [{ translateX: reduced ? 0 : -w * 0.22 * p }],
+      opacity: 1 - 0.45 * p,
+    };
+  });
 
   return (
     <View style={styles.root}>
@@ -136,6 +144,20 @@ export default function App() {
           <Pressable style={styles.previewTap} onPress={() => setRoute('seats')}>
             <View style={styles.preview} pointerEvents="none">
               {route === 'gallery' ? <SeatPicker frame={trailer} /> : null}
+            </View>
+          </Pressable>
+        </Frame>
+
+        <Frame
+          title="Coffee Order — Caffè Latte"
+          tone="dark"
+          fill
+          height={700}
+          action={<OpenButton onPress={() => setRoute('coffee')} />}
+        >
+          <Pressable style={styles.previewTap} onPress={() => setRoute('coffee')}>
+            <View style={styles.preview} pointerEvents="none">
+              {route === 'gallery' ? <CoffeeOrder /> : null}
             </View>
           </Pressable>
         </Frame>
@@ -191,9 +213,17 @@ export default function App() {
         </SafeAreaView>
       </Animated.View>
 
-      <PushScreen visible={route === 'seats'} progress={push}>
+      <PushScreen visible={route === 'seats'} progress={seatsPush}>
         <SeatPicker
           frame={trailer}
+          onClose={() => setRoute('gallery')}
+          insetTop={INSET_TOP}
+          insetBottom={INSET_BOTTOM}
+        />
+      </PushScreen>
+
+      <PushScreen visible={route === 'coffee'} progress={coffeePush}>
+        <CoffeeOrder
           onClose={() => setRoute('gallery')}
           insetTop={INSET_TOP}
           insetBottom={INSET_BOTTOM}
