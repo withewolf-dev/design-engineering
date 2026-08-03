@@ -22,7 +22,7 @@ import {
 import { useAssets } from 'expo-asset';
 import * as Haptics from 'expo-haptics';
 import { NumberFlow } from 'number-flow-react-native';
-import { type ReactNode, memo, useEffect, useMemo, useState } from 'react';
+import { type ReactNode, useEffect, useMemo, useState } from 'react';
 import {
   AppState,
   type LayoutChangeEvent,
@@ -39,7 +39,6 @@ import Animated, {
   useDerivedValue,
   useReducedMotion,
   useSharedValue,
-  withDelay,
   withSequence,
   withSpring,
   withTiming,
@@ -95,12 +94,6 @@ const SLOTS = ['1:00 PM', '3:00 PM', '7:30 PM', '9:00 PM'];
 
 const PRESELECTED = ['4-6', '4-7'];
 
-// front row (nearest the screen, furthest from the viewer) reads at 86% of the
-// back row, with the vertical gap closing to match
-const ROW_TAPER = 0.84;
-const ROW_GAP = 5;
-const rowScale = (r: number) =>
-  ROW_TAPER + (1 - ROW_TAPER) * (r / (LAYOUT.length - 1));
 
 /* ------------------------------------------------------------------ atoms */
 
@@ -390,126 +383,243 @@ function ProjectionScreen({
   );
 }
 
-/* -------------------------------------------------------------------- seat */
+/* -------------------------------------------------------------------- seats */
 
-type SeatState = 'free' | 'taken';
+// The whole house is ONE Skia canvas: 148 seats as three aggregated paths per
+// row (free / taken / selected) instead of ~450 native views. The rows sit on
+// a real perspective plane — same construction as the screen, tuned so the
+// front row reads ~0.85 of the back row, replacing the old per-row scale fake.
+// Interaction is one Pressable over the canvas with forward-mapped hit points.
+const GRID_TILT = 0.4; // positive: the TOP (near the screen) recedes
+const GRID_PERSP = 700;
+const GRID_GAP = 5;
 
-const Seat = memo(function Seat({
-  size,
-  state,
+type SeatCell = { id: string; row: number; col: number; taken: boolean };
+
+const CELLS: SeatCell[] = LAYOUT.flatMap((rowStr, row) =>
+  rowStr
+    .split('')
+    .map((ch, col) => ({ id: `${row}-${col}`, row, col, taken: ch === 'o' }))
+    .filter((_, col) => rowStr[col] !== '.'),
+);
+
+function gridGeometry(width: number) {
+  const gap = 6;
+  const cols = LAYOUT[0].length;
+  const seat = (width - 40 - gap * (cols - 1)) / cols;
+  const rows = LAYOUT.length;
+  const flatH = rows * seat + (rows - 1) * GRID_GAP;
+  const cx = width / 2;
+
+  const m = processTransform3d([
+    { translateX: cx },
+    { translateY: flatH / 2 },
+    { perspective: GRID_PERSP },
+    { rotateX: GRID_TILT },
+    { translateX: -cx },
+    { translateY: -flatH / 2 },
+  ]);
+
+  const topY = mapPoint3d(m, [cx, 0, 0])[1];
+  const botY = mapPoint3d(m, [cx, flatH, 0])[1];
+
+  // flat-space rect per seat + projected centre for hit-testing
+  const flat = (c: SeatCell) => ({
+    x: 20 + c.col * (seat + gap),
+    y: c.row * (seat + GRID_GAP),
+  });
+  const centers = CELLS.map((c) => {
+    const f = flat(c);
+    const p = mapPoint3d(m, [f.x + seat / 2, f.y + seat / 2, 0]);
+    return { id: c.id, taken: c.taken, x: p[0], y: p[1] - topY };
+  });
+
+  return { m, seat, flatH, H: botY - topY, offsetY: -topY, flat, centers };
+}
+
+// one path per (row, kind) — a tap rebuilds only the two kinds it touches
+function rowPaths(geo: ReturnType<typeof gridGeometry>, selected: string[]) {
+  const mk = () => Skia.Path.Make();
+  const rows: { free: SkPath; taken: SkPath; sel: SkPath }[] = LAYOUT.map(
+    () => ({ free: mk(), taken: mk(), sel: mk() }),
+  );
+  const s = geo.seat;
+  for (const c of CELLS) {
+    const { x, y } = geo.flat(c);
+    const kind = c.taken ? 'taken' : selected.includes(c.id) ? 'sel' : 'free';
+    const p = rows[c.row][kind];
+    // back + base, same silhouette the view version drew
+    p.addRRect(
+      Skia.RRectXY(
+        Skia.XYWHRect(x + s * 0.11, y, s * 0.78, s * 0.72),
+        s * 0.24,
+        s * 0.24,
+      ),
+    );
+    p.addRRect(
+      Skia.RRectXY(Skia.XYWHRect(x, y + s * 0.76, s, s * 0.24), s * 0.16, s * 0.16),
+    );
+  }
+  return rows;
+}
+
+function SeatCanvas({
+  width,
   selected,
-  delay,
   reduced,
-  onPress,
+  onToggle,
 }: {
-  size: number;
-  state: SeatState;
-  selected: boolean;
-  delay: number;
+  width: number;
+  selected: string[];
   reduced: boolean;
-  onPress: () => void;
+  onToggle: (id: string) => boolean | null;
 }) {
-  const sel = useSharedValue(selected ? 1 : 0);
-  const bump = useSharedValue(0);
-  const press = useSharedValue(1);
-  const enter = useSharedValue(0);
+  const geo = useMemo(() => gridGeometry(width), [width]);
 
+  // the one seat currently mid-animation: drawn by the overlay, skipped by the
+  // aggregate paths so it is never double-painted
+  const [active, setActive] = useState<string | null>(null);
+  const paths = useMemo(
+    () => rowPaths(geo, selected.filter((id) => id !== active)),
+    [geo, selected, active],
+  );
+  const activeCell = active ? CELLS.find((c) => c.id === active) : null;
+  const activeFlat = activeCell ? geo.flat(activeCell) : null;
+  const activeSelected = active != null && selected.includes(active);
+
+  // press / pop / colour for the overlay seat
+  const press = useSharedValue(1);
+  const bump = useSharedValue(0);
+  const sel = useSharedValue(activeSelected ? 1 : 0);
+
+  const activePath = useMemo(() => {
+    if (!activeFlat) return null;
+    const s = geo.seat;
+    const p = Skia.Path.Make();
+    p.addRRect(
+      Skia.RRectXY(
+        Skia.XYWHRect(activeFlat.x + s * 0.11, activeFlat.y, s * 0.78, s * 0.72),
+        s * 0.24,
+        s * 0.24,
+      ),
+    );
+    p.addRRect(
+      Skia.RRectXY(
+        Skia.XYWHRect(activeFlat.x, activeFlat.y + s * 0.76, s, s * 0.24),
+        s * 0.16,
+        s * 0.16,
+      ),
+    );
+    return p;
+  }, [activeFlat, geo]);
+
+  const overlayColor = useDerivedValue(() =>
+    interpolateColor(sel.value, [0, 1], [SEAT_FREE, SEAT_SEL]),
+  );
+  const overlayTransform = useDerivedValue(() => [
+    { scale: press.value * (1 + 0.1 * bump.value) },
+  ]);
+  const overlayOrigin = activeFlat
+    ? vec(activeFlat.x + geo.seat / 2, activeFlat.y + geo.seat / 2)
+    : vec(0, 0);
+
+  // entrance: one clock, each row reading its own slice of it
+  const enter = useSharedValue(0);
+  const ROW_STAG = 30;
+  const ROW_DUR = 320;
+  const total = ROW_DUR + ROW_STAG * (LAYOUT.length - 1);
   useEffect(() => {
-    enter.value = withDelay(delay, withTiming(1, { duration: 320, easing: EASE_OUT }));
+    enter.value = 0;
+    enter.value = withTiming(1, { duration: total, easing: Easing.linear });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  const rowProgress = LAYOUT.map((_, r) =>
+    // eslint-disable-next-line react-hooks/rules-of-hooks
+    useDerivedValue(() => {
+      const t = enter.value * total;
+      const p = Math.min(Math.max((t - r * ROW_STAG) / ROW_DUR, 0), 1);
+      // ease-out shape applied to the row's own slice
+      return 1 - (1 - p) * (1 - p);
+    }),
+  );
+  const rowTransforms = LAYOUT.map((_, r) =>
+    // eslint-disable-next-line react-hooks/rules-of-hooks
+    useDerivedValue(() => [
+      { translateY: reduced ? 0 : 6 * (1 - rowProgress[r].value) },
+    ]),
+  );
 
-  const first = useSharedValue(true);
-  useEffect(() => {
-    sel.value = withTiming(selected ? 1 : 0, { duration: 180, easing: EASE_OUT });
-    if (first.value) {
-      first.value = false;
-      return;
+  // hit-test against forward-mapped centres — no matrix inversion needed
+  const locate = (x: number, y: number) => {
+    let best: (typeof geo.centers)[number] | null = null;
+    let bestD = Infinity;
+    for (const c of geo.centers) {
+      const d = (c.x - x) ** 2 + (c.y - y) ** 2;
+      if (d < bestD) {
+        bestD = d;
+        best = c;
+      }
     }
-    if (reduced) return;
-    // one pop, then settle — a seat is claimed, not inflated
-    bump.value = withSequence(
-      withTiming(selected ? 1 : -0.5, { duration: 110, easing: EASE_OUT }),
-      withSpring(0, { damping: 15, stiffness: 340 }),
-    );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected]);
-
-  const back = useAnimatedStyle(() => ({
-    backgroundColor: interpolateColor(
-      sel.value,
-      [0, 1],
-      [state === 'taken' ? SEAT_TAKEN : SEAT_FREE, SEAT_SEL],
-    ),
-  }));
-
-  const base = useAnimatedStyle(() => ({
-    backgroundColor: interpolateColor(
-      sel.value,
-      [0, 1],
-      [state === 'taken' ? SEAT_TAKEN : SEAT_FREE, SEAT_SEL],
-    ),
-  }));
-
-  const wrap = useAnimatedStyle(() => ({
-    opacity: enter.value,
-    transform: reduced
-      ? [{ scale: 1 }]
-      : [
-          { translateY: 6 * (1 - enter.value) },
-          { scale: (0.92 + 0.08 * enter.value) * press.value * (1 + 0.1 * bump.value) },
-        ],
-  }));
-
-  const w = size;
-  const backH = size * 0.72;
+    return best && bestD <= (geo.seat * 0.85) ** 2 && !best.taken ? best : null;
+  };
 
   return (
     <Pressable
-      disabled={state === 'taken'}
-      hitSlop={4}
-      onPressIn={() => {
+      onPressIn={(e) => {
+        const hit = locate(e.nativeEvent.locationX, e.nativeEvent.locationY);
+        if (!hit) return;
+        setActive(hit.id);
+        sel.value = selected.includes(hit.id) ? 1 : 0;
         press.value = withTiming(0.88, { duration: 90, easing: EASE_OUT });
       }}
       onPressOut={() => {
         press.value = withTiming(1, { duration: 150, easing: EASE_OUT });
       }}
-      onPress={onPress}
+      onPress={(e) => {
+        const hit = locate(e.nativeEvent.locationX, e.nativeEvent.locationY);
+        if (!hit || hit.id !== active) return;
+        const nowSelected = onToggle(hit.id);
+        if (nowSelected === null) return; // rejected at the cap — no lie
+        sel.value = withTiming(nowSelected ? 1 : 0, {
+          duration: 180,
+          easing: EASE_OUT,
+        });
+        if (!reduced) {
+          // one pop, then settle — a seat is claimed, not inflated
+          bump.value = withSequence(
+            withTiming(nowSelected ? 1 : -0.5, { duration: 110, easing: EASE_OUT }),
+            withSpring(0, { damping: 15, stiffness: 340 }),
+          );
+        }
+      }}
     >
-      <Animated.View style={[{ width: w, height: size }, wrap]}>
-        <Animated.View
-          style={[
-            {
-              position: 'absolute',
-              left: w * 0.11,
-              right: w * 0.11,
-              top: 0,
-              height: backH,
-              borderTopLeftRadius: w * 0.3,
-              borderTopRightRadius: w * 0.3,
-              borderBottomLeftRadius: w * 0.12,
-              borderBottomRightRadius: w * 0.12,
-            },
-            back,
-          ]}
-        />
-        <Animated.View
-          style={[
-            {
-              position: 'absolute',
-              left: 0,
-              right: 0,
-              bottom: 0,
-              height: size * 0.24,
-              borderRadius: w * 0.16,
-            },
-            base,
-          ]}
-        />
-      </Animated.View>
+      <Canvas style={{ width, height: geo.H }}>
+        <Group transform={[{ translateY: geo.offsetY }]}>
+          <Group transform={[{ matrix: geo.m }]}>
+            {paths.map((row, r) => (
+              <Group
+                key={r}
+                opacity={rowProgress[r]}
+                transform={rowTransforms[r]}
+              >
+                <Path path={row.free} color={SEAT_FREE} />
+                <Path path={row.taken} color={SEAT_TAKEN} />
+                <Path path={row.sel} color={SEAT_SEL} />
+              </Group>
+            ))}
+
+            {activePath && (
+              <Group origin={overlayOrigin} transform={overlayTransform}>
+                <Path path={activePath} color={overlayColor} />
+              </Group>
+            )}
+          </Group>
+        </Group>
+      </Canvas>
     </Pressable>
   );
-});
+}
 
 /* ---------------------------------------------------------------- time slot */
 
@@ -607,25 +717,21 @@ export default function SeatPicker({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [count]);
 
-  const cols = LAYOUT[0].length;
-  // wider column gap → smaller seats → thirteen rows still fit the viewport
-  const gap = 6;
-  const gridW = Math.max(w - 40, 0);
-  const seat = gridW > 0 ? (gridW - gap * (cols - 1)) / cols : 0;
-
-  const toggle = (id: string) => {
-    setSelected((prev) => {
-      if (prev.includes(id)) {
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-        return prev.filter((s) => s !== id);
-      }
-      if (prev.length >= MAX_SEATS) {
-        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-        return prev;
-      }
-      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-      return [...prev, id];
-    });
+  // returns the seat's new selected state, or null if the tap was rejected
+  // (at the cap) — the canvas overlay animates only what actually happened
+  const toggle = (id: string): boolean | null => {
+    if (selected.includes(id)) {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+      setSelected(selected.filter((s) => s !== id));
+      return false;
+    }
+    if (selected.length >= MAX_SEATS) {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+      return null;
+    }
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    setSelected([...selected, id]);
+    return true;
   };
 
   // slot indicator — travels to the tapped pill
@@ -818,39 +924,14 @@ export default function SeatPicker({
       </View>
 
       <View style={styles.grid}>
-        {LAYOUT.map((row, r) => (
-          <View
-            key={r}
-            style={[
-              styles.gridRow,
-              {
-                gap,
-                // rows nearer the screen are further from *you* — they shrink
-                // and close up. Without this the plan reads as a diagram no
-                // matter how the screen is tilted. Set ROW_TAPER to 1 to kill.
-                transform: [{ scale: rowScale(r) }],
-                marginBottom:
-                  ROW_GAP * rowScale(r) - seat * (1 - rowScale(r)),
-              },
-            ]}
-          >
-            {row.split('').map((ch, c) => {
-              const id = `${r}-${c}`;
-              if (ch === '.') return <View key={id} style={{ width: seat, height: seat }} />;
-              return (
-                <Seat
-                  key={id}
-                  size={seat}
-                  state={ch === 'o' ? 'taken' : 'free'}
-                  selected={selected.includes(id)}
-                  delay={reduced ? 0 : Math.min((r * 2 + c) * 10, 260)}
-                  reduced={reduced}
-                  onPress={() => toggle(id)}
-                />
-              );
-            })}
-          </View>
-        ))}
+        {w > 0 && (
+          <SeatCanvas
+            width={w}
+            selected={selected}
+            reduced={reduced}
+            onToggle={toggle}
+          />
+        )}
       </View>
 
       <View style={styles.footer}>
@@ -1002,16 +1083,13 @@ const styles = StyleSheet.create({
     backgroundColor: '#C9C9CE',
   },
   grid: {
-    paddingHorizontal: 20,
+    // no horizontal padding: the canvas spans the full width and bakes the
+    // 20pt gutters into its own coordinates, so touch x/y map 1:1
     // slack lives *above* the grid, not below it: the seats sit close to the
     // slot picker they belong to, and the extra room reads as the dark throw
     // between the screen and the front row
     marginTop: 'auto',
     marginBottom: 4,
-  },
-  gridRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
   },
   footer: {
     // both this and the grid take an auto margin, so leftover height splits
