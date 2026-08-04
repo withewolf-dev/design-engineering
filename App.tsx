@@ -30,6 +30,7 @@ import StreakCard from './StreakCard';
 import SunriseDone from './SunriseDone';
 import SunsetCard from './SunsetCard';
 import TasksCard from './TasksCard';
+import WalletInsert from './WalletInsert';
 
 // Component library gallery. Each component lives in its own titled Frame.
 // Adding a component = add a new <Frame>. Nothing here gets removed to make
@@ -95,9 +96,10 @@ export default function App() {
   // between them before an animation settles (one screen's exit can get
   // overwritten by the other's entrance mid-flight, leaving it stuck mounted
   // underneath). The gallery's own recede reads whichever is further along.
-  const [route, setRoute] = useState<'gallery' | 'seats' | 'coffee'>('gallery');
+  const [route, setRoute] = useState<'gallery' | 'seats' | 'coffee' | 'wallet'>('gallery');
   const seatsPush = useSharedValue(0);
   const coffeePush = useSharedValue(0);
+  const walletPush = useSharedValue(0);
 
   // The trailer is owned here, where nothing ever unmounts. Skia's useVideo
   // disposes its native player on unmount while the frame callback is still
@@ -108,7 +110,7 @@ export default function App() {
   const w = Dimensions.get('window').width;
 
   const galleryStyle = useAnimatedStyle(() => {
-    const p = Math.max(seatsPush.value, coffeePush.value);
+    const p = Math.max(seatsPush.value, coffeePush.value, walletPush.value);
     return {
       transform: [{ translateX: reduced ? 0 : -w * 0.22 * p }],
       opacity: 1 - 0.45 * p,
@@ -158,6 +160,20 @@ export default function App() {
           <Pressable style={styles.previewTap} onPress={() => setRoute('coffee')}>
             <View style={styles.preview} pointerEvents="none">
               {route === 'gallery' ? <CoffeeOrder /> : null}
+            </View>
+          </Pressable>
+        </Frame>
+
+        <Frame
+          title="Wallet — File a Card"
+          tone="dark"
+          fill
+          height={760}
+          action={<OpenButton onPress={() => setRoute('wallet')} />}
+        >
+          <Pressable style={styles.previewTap} onPress={() => setRoute('wallet')}>
+            <View style={styles.preview} pointerEvents="none">
+              {route === 'gallery' ? <WalletInsert /> : null}
             </View>
           </Pressable>
         </Frame>
@@ -224,6 +240,14 @@ export default function App() {
 
       <PushScreen visible={route === 'coffee'} progress={coffeePush}>
         <CoffeeOrder
+          onClose={() => setRoute('gallery')}
+          insetTop={INSET_TOP}
+          insetBottom={INSET_BOTTOM}
+        />
+      </PushScreen>
+
+      <PushScreen visible={route === 'wallet'} progress={walletPush}>
+        <WalletInsert
           onClose={() => setRoute('gallery')}
           insetTop={INSET_TOP}
           insetBottom={INSET_BOTTOM}
