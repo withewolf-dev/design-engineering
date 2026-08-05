@@ -14,7 +14,6 @@ import {
   type LayoutChangeEvent,
   PanResponder,
   Platform,
-  Pressable,
   StyleSheet,
   Text,
   View,
@@ -144,34 +143,6 @@ const WALLET_TOP_INLINE = 96;
 // fully transparent, so a card there overlaps nothing and can be swapped in
 // front of it with no visible change.
 const PANEL_TOP_FRAC = 0.25;
-
-function PressScale({
-  onPress,
-  scaleTo = 0.97,
-  style,
-  children,
-}: {
-  onPress?: () => void;
-  scaleTo?: number;
-  style?: any;
-  children: ReactNode;
-}) {
-  const s = useSharedValue(1);
-  const a = useAnimatedStyle(() => ({ transform: [{ scale: s.value }] }));
-  return (
-    <Pressable
-      onPressIn={() => {
-        s.value = withTiming(scaleTo, { duration: 110, easing: EASE_OUT });
-      }}
-      onPressOut={() => {
-        s.value = withTiming(1, { duration: 160, easing: EASE_OUT });
-      }}
-      onPress={onPress}
-    >
-      <Animated.View style={[style, a]}>{children}</Animated.View>
-    </Pressable>
-  );
-}
 
 // two hairlines meeting at a point — cheaper and crisper than a glyph
 function Chevron({ size = 8, color = '#8A8A8E' }: { size?: number; color?: string }) {
@@ -693,11 +664,6 @@ export default function WalletInsert({
     >
       {full && (
         <View style={[styles.header, { top: insetTop ?? 10 }]}>
-          <PressScale scaleTo={0.92} style={styles.back} onPress={onClose}>
-            <View style={styles.backChevron}>
-              <Chevron size={9} color="#EDEDEF" />
-            </View>
-          </PressScale>
           <Text style={styles.title}>WALLET</Text>
         </View>
       )}
@@ -846,23 +812,6 @@ const styles = StyleSheet.create({
     height: 34,
     alignItems: 'center',
     justifyContent: 'center',
-  },
-  back: {
-    position: 'absolute',
-    left: 18,
-    top: 0,
-    width: 34,
-    height: 34,
-    borderRadius: 17,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: 'rgba(255,255,255,0.07)',
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: 'rgba(255,255,255,0.14)',
-    zIndex: 2,
-  },
-  backChevron: {
-    transform: [{ rotate: '-90deg' }, { translateX: 1 }],
   },
   title: {
     fontSize: 11,
