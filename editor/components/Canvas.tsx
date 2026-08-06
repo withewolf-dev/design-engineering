@@ -1,7 +1,16 @@
 'use client';
 
+import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
+import {
+  draggable,
+  dropTargetForElements,
+  monitorForElements,
+} from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
+import { disableNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/disable-native-drag-preview';
+import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useLayoutEffect,
@@ -26,20 +35,38 @@ import { useEditor } from '@/lib/store';
 // to the one screen size it was drawn on — the exact inconsistency this tool
 // exists to remove. So a drop resolves to a parent and an index, and the
 // generated VStack simply lists its children in a new order.
+//
+// The gesture lifecycle belongs to Pragmatic Drag and Drop. Hand-rolling it
+// meant owning pointer capture, cancellation and cleanup, and the bug that came
+// out of that — an interrupted drag leaving its listeners attached, so a later
+// release committed several stranded drags at once — is precisely the class of
+// problem a maintained library has already solved. What stays ours is the part
+// that is actually about this product: which slot a drop resolves to, and how
+// the stack opens to receive it.
 
 // Sliding out of the way is a response, so it eases and takes time. The thing
 // under the finger is not — it tracks 1:1, because anything else reads as the
 // app lagging rather than as the card having weight.
 const SETTLE = 'transform 200ms cubic-bezier(0.2, 0, 0, 1)';
-const LAND = 'transform 240ms cubic-bezier(0.2, 0, 0, 1)';
-const DRAG_THRESHOLD = 4;
+const LAND_MS = 240;
+const LAND = `transform ${LAND_MS}ms cubic-bezier(0.2, 0, 0, 1)`;
+
+/** A node flying from where it was released into the slot the commit gave it.
+ *  Held as state, not written to the DOM, so React remains the only writer of
+ *  `transform` — see the note on useDragStyle. */
+interface Landing {
+  id: string;
+  dx: number;
+  dy: number;
+  animate: boolean;
+}
 
 interface CanvasCtx {
   register: (id: string, el: HTMLElement | null) => void;
-  startDrag: (id: string, e: React.PointerEvent) => void;
   draggingId: string | null;
   dragOffset: { x: number; y: number };
   shifts: Shifts;
+  landing: Landing | null;
   suppressClick: React.RefObject<boolean>;
 }
 
@@ -51,10 +78,71 @@ function useCanvas(): CanvasCtx {
   return ctx;
 }
 
-/** Transform, transition and stacking for a node mid-drag. Shared by every node
- *  type so a button lifts exactly like a card does. */
+/**
+ * Wires one node into the drag system and into the rect registry.
+ *
+ * The element is tracked in state rather than a plain ref because the binding
+ * has to be torn down and re-attached when React swaps the DOM node out — which
+ * is exactly what a reorder does.
+ */
+function useNodeBinding(nodeId: string, isRoot: boolean) {
+  const { register } = useCanvas();
+  const [el, setEl] = useState<HTMLElement | null>(null);
+
+  const ref = useCallback(
+    (node: HTMLElement | null) => {
+      setEl(node);
+      register(nodeId, node);
+    },
+    [nodeId, register],
+  );
+
+  useEffect(() => {
+    if (!el) return;
+    if (isRoot) {
+      // The screen is the drop surface. Without a registered drop target the
+      // browser refuses the drop outright and every gesture ends as a cancel.
+      return dropTargetForElements({ element: el });
+    }
+    return draggable({
+      element: el,
+      getInitialData: () => ({ nodeId }),
+      onGenerateDragPreview: ({ nativeSetDragImage }) => {
+        // We draw the lift ourselves with a transform. The browser's ghost
+        // would be a second copy of the same element chasing the cursor.
+        disableNativeDragPreview({ nativeSetDragImage });
+      },
+    });
+  }, [el, nodeId, isRoot]);
+
+  return ref;
+}
+
+/**
+ * Transform, transition and stacking for a node mid-drag. Shared by every node
+ * type so a button lifts exactly like a card does.
+ *
+ * Every transform on this screen is produced here and nowhere else. An earlier
+ * version animated the landing by assigning `el.style.transform` directly while
+ * React was also writing that property from this style object — two writers,
+ * one property. When the cleanup listener didn't fire, the inline value stayed
+ * on the node forever and elements drifted out of the layout and overlapped
+ * each other. Anything that needs to move now goes through state.
+ */
 function useDragStyle(nodeId: string): React.CSSProperties {
-  const { draggingId, dragOffset, shifts } = useCanvas();
+  const { draggingId, dragOffset, shifts, landing } = useCanvas();
+
+  if (landing?.id === nodeId) {
+    return {
+      transform: `translate(${landing.dx}px, ${landing.dy}px)`,
+      // First frame pins it where the finger left it; the next frame animates
+      // to zero, which is now its real slot.
+      transition: landing.animate ? LAND : 'none',
+      zIndex: 40,
+      position: 'relative',
+    };
+  }
+
   if (!draggingId) return {};
 
   if (draggingId === nodeId) {
@@ -80,12 +168,13 @@ function useDragStyle(nodeId: string): React.CSSProperties {
 function NodeView({ node }: { node: SceneNode }) {
   const selectedId = useEditor((s) => s.selectedId);
   const select = useEditor((s) => s.select);
-  const { register, startDrag, suppressClick } = useCanvas();
+  const { suppressClick } = useCanvas();
   const drag = useDragStyle(node.id);
 
+  const isRoot = node.type === 'screen';
+  const ref = useNodeBinding(node.id, isRoot);
   const selected = selectedId === node.id;
   const ring = selected ? '0 0 0 2px var(--accent)' : undefined;
-  const isRoot = node.type === 'screen';
 
   function onClick(e: React.MouseEvent) {
     e.stopPropagation();
@@ -93,21 +182,13 @@ function NodeView({ node }: { node: SceneNode }) {
     select(node.id);
   }
 
-  function onPointerDown(e: React.PointerEvent) {
-    if (isRoot) return;
-    e.stopPropagation();
-    startDrag(node.id, e);
-  }
-
-  const common = { onClick, onPointerDown };
-
   switch (node.type) {
     case 'screen': {
       const p = node.props;
       return (
         <div
           onClick={onClick}
-          ref={(el) => register(node.id, el)}
+          ref={ref}
           className="flex h-full w-full cursor-default"
           style={{
             flexDirection: p.direction === 'vertical' ? 'column' : 'row',
@@ -129,9 +210,9 @@ function NodeView({ node }: { node: SceneNode }) {
       const p = node.props;
       return (
         <div
-          {...common}
-          ref={(el: HTMLDivElement | null) => register(node.id, el)}
-          className="flex w-full cursor-grab touch-none rounded-lg active:cursor-grabbing"
+          onClick={onClick}
+          ref={ref}
+          className="flex w-full cursor-grab rounded-lg active:cursor-grabbing"
           style={{
             flexDirection: p.direction === 'vertical' ? 'column' : 'row',
             alignItems: alignToCss(p.align),
@@ -152,9 +233,9 @@ function NodeView({ node }: { node: SceneNode }) {
       const p = node.props;
       return (
         <span
-          {...common}
-          ref={(el: HTMLSpanElement | null) => register(node.id, el)}
-          className="cursor-grab touch-none rounded px-1 py-px active:cursor-grabbing"
+          onClick={onClick}
+          ref={ref}
+          className="cursor-grab rounded px-1 py-px active:cursor-grabbing"
           style={{
             fontSize: p.size,
             fontWeight: weightToCss(p.weight),
@@ -174,9 +255,9 @@ function NodeView({ node }: { node: SceneNode }) {
       const p = node.props;
       return (
         <div
-          {...common}
-          ref={(el: HTMLDivElement | null) => register(node.id, el)}
-          className="w-full cursor-grab touch-none active:cursor-grabbing"
+          onClick={onClick}
+          ref={ref}
+          className="w-full cursor-grab active:cursor-grabbing"
           style={{
             minHeight: p.height,
             borderRadius: p.cornerRadius,
@@ -198,9 +279,9 @@ function NodeView({ node }: { node: SceneNode }) {
       const p = node.props;
       return (
         <button
-          {...common}
-          ref={(el: HTMLButtonElement | null) => register(node.id, el)}
-          className="flex w-full cursor-grab touch-none items-center justify-center font-semibold active:cursor-grabbing"
+          onClick={onClick}
+          ref={ref}
+          className="flex w-full cursor-grab items-center justify-center font-semibold active:cursor-grabbing"
           style={{
             minHeight: p.height,
             borderRadius: p.cornerRadius,
@@ -248,8 +329,6 @@ const NO_SHIFTS: Shifts = new Map();
 export function Canvas() {
   const root = useEditor((s) => s.doc.root);
   const select = useEditor((s) => s.select);
-  const begin = useEditor((s) => s.begin);
-  const moveNode = useEditor((s) => s.moveNode);
   const playToken = useEditor((s) => s.playToken);
   const playNodeId = useEditor((s) => s.playNodeId);
 
@@ -258,98 +337,99 @@ export function Canvas() {
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [shifts, setShifts] = useState<Shifts>(NO_SHIFTS);
   const [drop, setDrop] = useState<DropTarget | null>(null);
+  const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
   const raf = useRef<number | null>(null);
 
   const elements = useRef(new Map<string, HTMLElement>()).current;
   const suppressClick = useRef(false);
+  const [landing, setLanding] = useState<Landing | null>(null);
   // Where the dragged node was on screen at the moment of release, so it can be
   // animated from there into whatever slot the commit gave it.
-  const landing = useRef<{ id: string; rect: DOMRect } | null>(null);
-  const dragActive = useRef(false);
+  const released = useRef<{ id: string; rect: DOMRect } | null>(null);
+  // Snapshotted once per gesture. Measuring live would feed the sibling
+  // transforms back into the hit-test and oscillate under the cursor.
+  const rects = useRef<Map<string, DOMRect> | null>(null);
+  const origin = useRef({ x: 0, y: 0 });
+  const target = useRef<DropTarget | null>(null);
   const rootRef = useRef(root);
   rootRef.current = root;
 
-  function register(id: string, el: HTMLElement | null) {
-    if (el) elements.set(id, el);
-    else elements.delete(id);
-  }
+  const register = useCallback(
+    (id: string, el: HTMLElement | null) => {
+      if (el) elements.set(id, el);
+      else elements.delete(id);
+    },
+    [elements],
+  );
 
-  function startDrag(id: string, e: React.PointerEvent) {
-    // One gesture at a time. A drag interrupted without a pointerup — the
-    // window losing focus, the OS cancelling the pointer — used to leave its
-    // listeners attached, so the next release fired every stranded drag's
-    // commit at once and moved several unrelated nodes.
-    if (dragActive.current) return;
-    dragActive.current = true;
+  useEffect(() => {
+    return monitorForElements({
+      canMonitor: ({ source }) => typeof source.data.nodeId === 'string',
 
-    const startX = e.clientX;
-    const startY = e.clientY;
-    let active = false;
-    let finished = false;
-    let latest: DropTarget | null = null;
-    let rects: Map<string, DOMRect> | null = null;
-
-    function move(ev: PointerEvent) {
-      if (!active) {
-        // A press that never travels is a click. Waiting for real movement is
-        // what keeps selection working on elements that are also draggable.
-        if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < DRAG_THRESHOLD)
-          return;
-        active = true;
-        // Snapshot before anything is transformed, and reuse all gesture long.
-        rects = snapshotRects(elements);
+      onDragStart: ({ source, location }) => {
+        const id = source.data.nodeId as string;
+        rects.current = snapshotRects(elements);
+        origin.current = {
+          x: location.current.input.clientX,
+          y: location.current.input.clientY,
+        };
+        target.current = null;
+        setLanding(null);
         setDraggingId(id);
-        document.body.style.userSelect = 'none';
-      }
-      if (!rects) return;
+        setDragOffset({ x: 0, y: 0 });
+      },
 
-      setDragOffset({ x: ev.clientX - startX, y: ev.clientY - startY });
-      latest = computeDrop(ev.clientX, ev.clientY, rootRef.current, rects, id);
-      setDrop(latest);
-      setShifts(computeShifts(rootRef.current, rects, id, latest));
-    }
+      onDrag: ({ source, location }) => {
+        const id = source.data.nodeId as string;
+        const snapshot = rects.current;
+        if (!snapshot) return;
+        const { clientX, clientY } = location.current.input;
 
-    function finish(commit: boolean) {
-      if (finished) return;
-      finished = true;
-      dragActive.current = false;
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', onUp);
-      window.removeEventListener('pointercancel', onCancel);
-      window.removeEventListener('blur', onCancel);
-      document.body.style.userSelect = '';
+        setDragOffset({
+          x: clientX - origin.current.x,
+          y: clientY - origin.current.y,
+        });
+        const next = computeDrop(clientX, clientY, rootRef.current, snapshot, id);
+        target.current = next;
+        setDrop(next);
+        setShifts(computeShifts(rootRef.current, snapshot, id, next));
+      },
 
-      if (active) {
-        if (latest && commit) {
+      onDrop: ({ source, location }) => {
+        const id = source.data.nodeId as string;
+        const resolved = target.current;
+        // onDrop fires however the gesture ended, including a cancel. An empty
+        // dropTargets list is the only signal that it was not a real drop, so
+        // this is where committing is decided.
+        const landed = location.current.dropTargets.length > 0;
+
+        if (landed && resolved) {
           const el = elements.get(id);
-          if (el) landing.current = { id, rect: el.getBoundingClientRect() };
-          begin();
-          moveNode(id, latest.parentId, latest.index);
-          select(id);
+          if (el) released.current = { id, rect: el.getBoundingClientRect() };
+          const store = useEditor.getState();
+          store.begin();
+          store.moveNode(id, resolved.parentId, resolved.index);
+          store.select(id);
+          suppressClick.current = true;
+          setTimeout(() => {
+            suppressClick.current = false;
+          }, 0);
         }
-        // The click that follows this pointerup would otherwise re-select
-        // whatever the cursor happened to end up over.
-        suppressClick.current = true;
-        setTimeout(() => {
-          suppressClick.current = false;
-        }, 0);
-      }
-      setDraggingId(null);
-      setDragOffset({ x: 0, y: 0 });
-      setShifts(NO_SHIFTS);
-      setDrop(null);
-    }
 
-    const onUp = () => finish(true);
-    // Cancelling puts everything back rather than committing a drop the user
-    // never released on.
-    const onCancel = () => finish(false);
+        setDraggingId(null);
+        setDragOffset({ x: 0, y: 0 });
+        setShifts(NO_SHIFTS);
+        setDrop(null);
+        rects.current = null;
+        target.current = null;
+      },
+    });
+  }, [elements]);
 
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', onUp);
-    window.addEventListener('pointercancel', onCancel);
-    window.addEventListener('blur', onCancel);
-  }
+  useEffect(() => {
+    if (!scrollEl) return;
+    return autoScrollForElements({ element: scrollEl });
+  }, [scrollEl]);
 
   // Fly the dropped node from where the finger left it into its new slot.
   //
@@ -357,33 +437,44 @@ export function Canvas() {
   // truth — so this measures the gap the commit opened up and plays it back as
   // motion. Without it the node teleports, and the drag ends by contradicting
   // the gap the siblings just spent 200ms opening.
+  //
+  // Measured in a layout effect, before the browser paints, so the node is
+  // never seen in its new position without the offset applied.
   useLayoutEffect(() => {
-    const pending = landing.current;
+    const pending = released.current;
     if (!pending) return;
-    landing.current = null;
+    released.current = null;
 
     const el = elements.get(pending.id);
     if (!el) return;
     const now = el.getBoundingClientRect();
     const dx = pending.rect.left - now.left;
     const dy = pending.rect.top - now.top;
+    // Landing where it was already sitting needs no animation, and starting one
+    // would leave a transform to clean up for no visible gain.
     if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return;
 
-    el.style.transition = 'none';
-    el.style.transform = `translate(${dx}px, ${dy}px)`;
-
-    const id = requestAnimationFrame(() => {
-      el.style.transition = LAND;
-      el.style.transform = '';
-      const clear = () => {
-        el.style.transition = '';
-        el.style.transform = '';
-        el.removeEventListener('transitionend', clear);
-      };
-      el.addEventListener('transitionend', clear);
-    });
-    return () => cancelAnimationFrame(id);
+    setLanding({ id: pending.id, dx, dy, animate: false });
   });
+
+  // Second frame: release it to zero and let the transition carry it home. The
+  // state is dropped once the animation is over, which is also what removes the
+  // transform — by then it is translate(0,0) and removing it changes nothing.
+  useEffect(() => {
+    if (!landing || landing.animate) return;
+    const frame = requestAnimationFrame(() =>
+      setLanding((prev) =>
+        prev && prev.id === landing.id ? { ...prev, dx: 0, dy: 0, animate: true } : prev,
+      ),
+    );
+    return () => cancelAnimationFrame(frame);
+  }, [landing]);
+
+  useEffect(() => {
+    if (!landing?.animate) return;
+    const timer = setTimeout(() => setLanding(null), LAND_MS + 60);
+    return () => clearTimeout(timer);
+  }, [landing]);
 
   useEffect(() => {
     if (!playToken || !playNodeId) return;
@@ -414,6 +505,7 @@ export function Canvas() {
 
   return (
     <div
+      ref={setScrollEl}
       className="flex flex-1 items-center justify-center overflow-auto p-8"
       onClick={() => select(null)}
     >
@@ -436,10 +528,10 @@ export function Canvas() {
               <Ctx.Provider
                 value={{
                   register,
-                  startDrag,
                   draggingId,
                   dragOffset,
                   shifts,
+                  landing,
                   suppressClick,
                 }}
               >
