@@ -256,6 +256,22 @@ export function findParent(
   return null;
 }
 
+/**
+ * Is `id` inside `ancestorId`? The guard that stops a drag from dropping a
+ * stack into its own child, which would detach that subtree from the document
+ * and lose it.
+ */
+export function isDescendant(
+  root: SceneNode,
+  ancestorId: string,
+  id: string,
+): boolean {
+  if (id === ancestorId) return false;
+  const ancestor = findNode(root, ancestorId);
+  if (!ancestor || !isContainer(ancestor)) return false;
+  return findNode(ancestor, id) !== null;
+}
+
 /** Depth-first walk, yielding each node with its depth for the layer tree. */
 export function flatten(
   node: SceneNode,

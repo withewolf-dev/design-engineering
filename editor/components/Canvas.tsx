@@ -1,6 +1,14 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
+import type { DropTarget } from '@/lib/drop';
+import { computeDrop } from '@/lib/drop';
 import { at, sampleMotion } from '@/lib/motion';
 import { alignToCss, fillToCss, weightToCss } from '@/lib/render';
 import type { SceneNode } from '@/lib/schema';
@@ -11,24 +19,54 @@ import { useEditor } from '@/lib/store';
 // own about what anything looks like, so there is exactly one description of
 // the design in the system and no chance of the preview and the export
 // disagreeing.
+//
+// Dragging moves nodes BETWEEN and WITHIN stacks; it never assigns a position.
+// Free placement would have to compile to `.offset(x:y:)`, which pins a design
+// to the one screen size it was drawn on — the exact inconsistency this tool
+// exists to remove. So a drop resolves to a parent and an index, and the
+// generated VStack simply lists its children in a new order.
+
+interface CanvasCtx {
+  register: (id: string, el: HTMLElement | null) => void;
+  startDrag: (id: string, e: React.PointerEvent) => void;
+  draggingId: string | null;
+  suppressClick: React.RefObject<boolean>;
+}
+
+const Ctx = createContext<CanvasCtx | null>(null);
+
+function useCanvas(): CanvasCtx {
+  const ctx = useContext(Ctx);
+  if (!ctx) throw new Error('NodeView must render inside Canvas');
+  return ctx;
+}
 
 function NodeView({ node }: { node: SceneNode }) {
   const selectedId = useEditor((s) => s.selectedId);
-  const focus = useEditor((s) => s.focus);
   const select = useEditor((s) => s.select);
+  const { register, startDrag, draggingId, suppressClick } = useCanvas();
 
   const selected = selectedId === node.id;
-  // Drilling into a fill still means the box it belongs to is what's selected.
-  const outline = selected
-    ? focus === 'fill' || focus === 'node' || focus === 'interaction' || focus === 'motion'
-    : false;
-
-  const ring = outline ? '0 0 0 2px var(--accent)' : undefined;
+  const ring = selected ? '0 0 0 2px var(--accent)' : undefined;
+  const isRoot = node.type === 'screen';
+  // The node being dragged stays in place and goes translucent rather than
+  // following the cursor: the insertion line already says where it will land,
+  // and a floating copy would cover the very gaps it is aiming between.
+  const dragOpacityFactor = draggingId === node.id ? 0.35 : 1;
 
   function onClick(e: React.MouseEvent) {
     e.stopPropagation();
+    if (suppressClick.current) return;
     select(node.id);
   }
+
+  function onPointerDown(e: React.PointerEvent) {
+    if (isRoot) return;
+    e.stopPropagation();
+    startDrag(node.id, e);
+  }
+
+  const common = { onClick, onPointerDown };
 
   switch (node.type) {
     case 'screen': {
@@ -36,6 +74,7 @@ function NodeView({ node }: { node: SceneNode }) {
       return (
         <div
           onClick={onClick}
+          ref={(el) => register(node.id, el)}
           className="flex h-full w-full cursor-default"
           style={{
             flexDirection: p.direction === 'vertical' ? 'column' : 'row',
@@ -57,14 +96,15 @@ function NodeView({ node }: { node: SceneNode }) {
       const p = node.props;
       return (
         <div
-          onClick={onClick}
-          className="flex w-full cursor-pointer rounded-lg"
+          {...common}
+          ref={(el: HTMLDivElement | null) => register(node.id, el)}
+          className="flex w-full cursor-grab touch-none rounded-lg active:cursor-grabbing"
           style={{
             flexDirection: p.direction === 'vertical' ? 'column' : 'row',
             alignItems: alignToCss(p.align),
             gap: p.gap,
             padding: p.padding,
-            opacity: p.opacity / 100,
+            opacity: (p.opacity / 100) * dragOpacityFactor,
             boxShadow: ring,
           }}
         >
@@ -78,13 +118,14 @@ function NodeView({ node }: { node: SceneNode }) {
       const p = node.props;
       return (
         <span
-          onClick={onClick}
-          className="cursor-pointer rounded px-1 py-px"
+          {...common}
+          ref={(el: HTMLSpanElement | null) => register(node.id, el)}
+          className="cursor-grab touch-none rounded px-1 py-px active:cursor-grabbing"
           style={{
             fontSize: p.size,
             fontWeight: weightToCss(p.weight),
             color: p.color,
-            opacity: p.opacity / 100,
+            opacity: (p.opacity / 100) * dragOpacityFactor,
             letterSpacing: p.size <= 12 ? '0.07em' : undefined,
             boxShadow: ring,
           }}
@@ -98,13 +139,14 @@ function NodeView({ node }: { node: SceneNode }) {
       const p = node.props;
       return (
         <div
-          onClick={onClick}
-          className="w-full cursor-pointer"
+          {...common}
+          ref={(el: HTMLDivElement | null) => register(node.id, el)}
+          className="w-full cursor-grab touch-none active:cursor-grabbing"
           style={{
             minHeight: p.height,
             borderRadius: p.cornerRadius,
             background: fillToCss(p.fill),
-            opacity: p.opacity / 100,
+            opacity: (p.opacity / 100) * dragOpacityFactor,
             boxShadow: [
               p.shadow ? '0 10px 26px -12px rgba(0,0,0,0.6)' : '',
               ring ?? '',
@@ -120,14 +162,15 @@ function NodeView({ node }: { node: SceneNode }) {
       const p = node.props;
       return (
         <button
-          onClick={onClick}
-          className="flex w-full items-center justify-center font-semibold"
+          {...common}
+          ref={(el: HTMLButtonElement | null) => register(node.id, el)}
+          className="flex w-full cursor-grab touch-none items-center justify-center font-semibold active:cursor-grabbing"
           style={{
             minHeight: p.height,
             borderRadius: p.cornerRadius,
             background: fillToCss(p.fill),
             color: p.textColor,
-            opacity: p.opacity / 100,
+            opacity: (p.opacity / 100) * dragOpacityFactor,
             fontSize: 15,
             boxShadow: ring,
           }}
@@ -163,14 +206,77 @@ function Sheet({ progress, title }: { progress: number; title: string }) {
   );
 }
 
+const DRAG_THRESHOLD = 4;
+
 export function Canvas() {
   const root = useEditor((s) => s.doc.root);
   const select = useEditor((s) => s.select);
+  const begin = useEditor((s) => s.begin);
+  const moveNode = useEditor((s) => s.moveNode);
   const playToken = useEditor((s) => s.playToken);
   const playNodeId = useEditor((s) => s.playNodeId);
 
   const [sheet, setSheet] = useState({ progress: 0, title: '' });
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [drop, setDrop] = useState<DropTarget | null>(null);
   const raf = useRef<number | null>(null);
+
+  const elements = useRef(new Map<string, HTMLElement>()).current;
+  const suppressClick = useRef(false);
+  // Read inside pointer handlers that outlive the render they were created in.
+  const rootRef = useRef(root);
+  rootRef.current = root;
+
+  function register(id: string, el: HTMLElement | null) {
+    if (el) elements.set(id, el);
+    else elements.delete(id);
+  }
+
+  function startDrag(id: string, e: React.PointerEvent) {
+    const startX = e.clientX;
+    const startY = e.clientY;
+    let active = false;
+    let latest: DropTarget | null = null;
+
+    function move(ev: PointerEvent) {
+      if (!active) {
+        // A press that never travels is a click. Waiting for real movement is
+        // what keeps selection working on elements that are also draggable.
+        if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < DRAG_THRESHOLD)
+          return;
+        active = true;
+        setDraggingId(id);
+        document.body.style.userSelect = 'none';
+      }
+      latest = computeDrop(ev.clientX, ev.clientY, rootRef.current, elements, id);
+      setDrop(latest);
+    }
+
+    function up() {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      document.body.style.userSelect = '';
+
+      if (active) {
+        if (latest) {
+          begin();
+          moveNode(id, latest.parentId, latest.index);
+          select(id);
+        }
+        // The click that follows this pointerup would otherwise re-select
+        // whatever the cursor happened to end up over.
+        suppressClick.current = true;
+        setTimeout(() => {
+          suppressClick.current = false;
+        }, 0);
+      }
+      setDraggingId(null);
+      setDrop(null);
+    }
+
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  }
 
   useEffect(() => {
     if (!playToken || !playNodeId) return;
@@ -180,9 +286,6 @@ export function Canvas() {
 
     const sampled = sampleMotion(interaction.motion);
     const title = interaction.actionLabel ?? 'Details';
-    // Replay always runs open → closed → open? No: it opens if closed, closes if
-    // open, so repeated presses read as operating the sheet rather than as a
-    // demo loop.
     const opening = sheet.progress < 0.5;
     const start = performance.now();
 
@@ -223,7 +326,11 @@ export function Canvas() {
               <span>••• ▲ ■</span>
             </div>
             <div className="h-[calc(100%-28px)]">
-              <NodeView node={root} />
+              <Ctx.Provider
+                value={{ register, startDrag, draggingId, suppressClick }}
+              >
+                <NodeView node={root} />
+              </Ctx.Provider>
             </div>
             {sheet.progress > 0.001 && (
               <Sheet progress={sheet.progress} title={sheet.title} />
@@ -234,6 +341,21 @@ export function Canvas() {
           292 × 600
         </div>
       </div>
+
+      {/* Fixed-position so it can be drawn over the phone's rounded clip without
+          being cut off by it, and so it never disturbs the layout it measures. */}
+      {drop && (
+        <div
+          className="pointer-events-none fixed z-50 rounded-full bg-[var(--accent)]"
+          style={{
+            left: drop.line.left,
+            top: drop.line.top,
+            width: drop.line.width,
+            height: drop.line.height,
+            boxShadow: '0 0 8px var(--accent)',
+          }}
+        />
+      )}
     </div>
   );
 }

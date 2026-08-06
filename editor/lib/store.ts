@@ -5,7 +5,7 @@ import { create } from 'zustand';
 import { immer } from 'zustand/middleware/immer';
 import { seedDocument } from './document';
 import type { Fill, Motion, SceneDocument, SceneNode } from './schema';
-import { findNode, propsOf } from './schema';
+import { findNode, findParent, isContainer, isDescendant, propsOf } from './schema';
 
 /**
  * Where the inspector is pointed. Selection alone isn't enough — the same node
@@ -52,6 +52,14 @@ interface EditorState {
   removeStop: (id: string, index: number) => void;
   convertFill: (id: string, to: Fill['type']) => void;
   setMotion: (id: string, motion: Motion) => void;
+
+  /**
+   * Reparent and reorder in one operation, because they're the same gesture.
+   * `index` is expressed against the target's children WITH the dragged node
+   * already excluded, so removing before inserting needs no index fixup — the
+   * usual off-by-one when a node moves down within its own parent.
+   */
+  moveNode: (id: string, parentId: string, index: number) => void;
 
   undo: () => void;
   redo: () => void;
@@ -184,6 +192,25 @@ export const useEditor = create<EditorState>()(
       set((s) => {
         const node = findNode(s.doc.root, id);
         if (node?.interaction) node.interaction.motion = motion;
+      }),
+
+    moveNode: (id, parentId, index) =>
+      set((s) => {
+        if (id === parentId || isDescendant(s.doc.root, id, parentId)) return;
+        const oldParent = findParent(s.doc.root, id);
+        const newParent = findNode(s.doc.root, parentId);
+        if (!oldParent?.children || !newParent || !isContainer(newParent)) return;
+
+        const from = oldParent.children.findIndex((c) => c.id === id);
+        if (from < 0) return;
+        const [moved] = oldParent.children.splice(from, 1);
+
+        if (!newParent.children) newParent.children = [];
+        newParent.children.splice(
+          Math.max(0, Math.min(index, newParent.children.length)),
+          0,
+          moved,
+        );
       }),
 
     undo: () =>
