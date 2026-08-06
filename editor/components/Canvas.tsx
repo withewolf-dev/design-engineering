@@ -4,11 +4,12 @@ import {
   createContext,
   useContext,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from 'react';
-import type { DropTarget } from '@/lib/drop';
-import { computeDrop } from '@/lib/drop';
+import type { DropTarget, Shifts } from '@/lib/drop';
+import { computeDrop, computeShifts, snapshotRects } from '@/lib/drop';
 import { at, sampleMotion } from '@/lib/motion';
 import { alignToCss, fillToCss, weightToCss } from '@/lib/render';
 import type { SceneNode } from '@/lib/schema';
@@ -26,10 +27,19 @@ import { useEditor } from '@/lib/store';
 // exists to remove. So a drop resolves to a parent and an index, and the
 // generated VStack simply lists its children in a new order.
 
+// Sliding out of the way is a response, so it eases and takes time. The thing
+// under the finger is not — it tracks 1:1, because anything else reads as the
+// app lagging rather than as the card having weight.
+const SETTLE = 'transform 200ms cubic-bezier(0.2, 0, 0, 1)';
+const LAND = 'transform 240ms cubic-bezier(0.2, 0, 0, 1)';
+const DRAG_THRESHOLD = 4;
+
 interface CanvasCtx {
   register: (id: string, el: HTMLElement | null) => void;
   startDrag: (id: string, e: React.PointerEvent) => void;
   draggingId: string | null;
+  dragOffset: { x: number; y: number };
+  shifts: Shifts;
   suppressClick: React.RefObject<boolean>;
 }
 
@@ -41,18 +51,41 @@ function useCanvas(): CanvasCtx {
   return ctx;
 }
 
+/** Transform, transition and stacking for a node mid-drag. Shared by every node
+ *  type so a button lifts exactly like a card does. */
+function useDragStyle(nodeId: string): React.CSSProperties {
+  const { draggingId, dragOffset, shifts } = useCanvas();
+  if (!draggingId) return {};
+
+  if (draggingId === nodeId) {
+    return {
+      transform: `translate(${dragOffset.x}px, ${dragOffset.y}px) scale(1.03)`,
+      transition: 'none',
+      zIndex: 40,
+      position: 'relative',
+      pointerEvents: 'none',
+      // Lifting it off the surface is what makes the gap below read as a hole
+      // rather than as the layout having broken.
+      filter: 'drop-shadow(0 12px 24px rgba(0,0,0,0.55))',
+    };
+  }
+
+  const shift = shifts.get(nodeId) ?? { x: 0, y: 0 };
+  return {
+    transform: `translate(${shift.x}px, ${shift.y}px)`,
+    transition: SETTLE,
+  };
+}
+
 function NodeView({ node }: { node: SceneNode }) {
   const selectedId = useEditor((s) => s.selectedId);
   const select = useEditor((s) => s.select);
-  const { register, startDrag, draggingId, suppressClick } = useCanvas();
+  const { register, startDrag, suppressClick } = useCanvas();
+  const drag = useDragStyle(node.id);
 
   const selected = selectedId === node.id;
   const ring = selected ? '0 0 0 2px var(--accent)' : undefined;
   const isRoot = node.type === 'screen';
-  // The node being dragged stays in place and goes translucent rather than
-  // following the cursor: the insertion line already says where it will land,
-  // and a floating copy would cover the very gaps it is aiming between.
-  const dragOpacityFactor = draggingId === node.id ? 0.35 : 1;
 
   function onClick(e: React.MouseEvent) {
     e.stopPropagation();
@@ -104,8 +137,9 @@ function NodeView({ node }: { node: SceneNode }) {
             alignItems: alignToCss(p.align),
             gap: p.gap,
             padding: p.padding,
-            opacity: (p.opacity / 100) * dragOpacityFactor,
+            opacity: p.opacity / 100,
             boxShadow: ring,
+            ...drag,
           }}
         >
           {isContainer(node) &&
@@ -125,9 +159,10 @@ function NodeView({ node }: { node: SceneNode }) {
             fontSize: p.size,
             fontWeight: weightToCss(p.weight),
             color: p.color,
-            opacity: (p.opacity / 100) * dragOpacityFactor,
+            opacity: p.opacity / 100,
             letterSpacing: p.size <= 12 ? '0.07em' : undefined,
             boxShadow: ring,
+            ...drag,
           }}
         >
           {p.content}
@@ -146,13 +181,14 @@ function NodeView({ node }: { node: SceneNode }) {
             minHeight: p.height,
             borderRadius: p.cornerRadius,
             background: fillToCss(p.fill),
-            opacity: (p.opacity / 100) * dragOpacityFactor,
+            opacity: p.opacity / 100,
             boxShadow: [
               p.shadow ? '0 10px 26px -12px rgba(0,0,0,0.6)' : '',
               ring ?? '',
             ]
               .filter(Boolean)
               .join(', '),
+            ...drag,
           }}
         />
       );
@@ -170,9 +206,10 @@ function NodeView({ node }: { node: SceneNode }) {
             borderRadius: p.cornerRadius,
             background: fillToCss(p.fill),
             color: p.textColor,
-            opacity: (p.opacity / 100) * dragOpacityFactor,
+            opacity: p.opacity / 100,
             fontSize: 15,
             boxShadow: ring,
+            ...drag,
           }}
         >
           {p.label}
@@ -206,7 +243,7 @@ function Sheet({ progress, title }: { progress: number; title: string }) {
   );
 }
 
-const DRAG_THRESHOLD = 4;
+const NO_SHIFTS: Shifts = new Map();
 
 export function Canvas() {
   const root = useEditor((s) => s.doc.root);
@@ -218,12 +255,17 @@ export function Canvas() {
 
   const [sheet, setSheet] = useState({ progress: 0, title: '' });
   const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+  const [shifts, setShifts] = useState<Shifts>(NO_SHIFTS);
   const [drop, setDrop] = useState<DropTarget | null>(null);
   const raf = useRef<number | null>(null);
 
   const elements = useRef(new Map<string, HTMLElement>()).current;
   const suppressClick = useRef(false);
-  // Read inside pointer handlers that outlive the render they were created in.
+  // Where the dragged node was on screen at the moment of release, so it can be
+  // animated from there into whatever slot the commit gave it.
+  const landing = useRef<{ id: string; rect: DOMRect } | null>(null);
+  const dragActive = useRef(false);
   const rootRef = useRef(root);
   rootRef.current = root;
 
@@ -233,10 +275,19 @@ export function Canvas() {
   }
 
   function startDrag(id: string, e: React.PointerEvent) {
+    // One gesture at a time. A drag interrupted without a pointerup — the
+    // window losing focus, the OS cancelling the pointer — used to leave its
+    // listeners attached, so the next release fired every stranded drag's
+    // commit at once and moved several unrelated nodes.
+    if (dragActive.current) return;
+    dragActive.current = true;
+
     const startX = e.clientX;
     const startY = e.clientY;
     let active = false;
+    let finished = false;
     let latest: DropTarget | null = null;
+    let rects: Map<string, DOMRect> | null = null;
 
     function move(ev: PointerEvent) {
       if (!active) {
@@ -245,20 +296,33 @@ export function Canvas() {
         if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < DRAG_THRESHOLD)
           return;
         active = true;
+        // Snapshot before anything is transformed, and reuse all gesture long.
+        rects = snapshotRects(elements);
         setDraggingId(id);
         document.body.style.userSelect = 'none';
       }
-      latest = computeDrop(ev.clientX, ev.clientY, rootRef.current, elements, id);
+      if (!rects) return;
+
+      setDragOffset({ x: ev.clientX - startX, y: ev.clientY - startY });
+      latest = computeDrop(ev.clientX, ev.clientY, rootRef.current, rects, id);
       setDrop(latest);
+      setShifts(computeShifts(rootRef.current, rects, id, latest));
     }
 
-    function up() {
+    function finish(commit: boolean) {
+      if (finished) return;
+      finished = true;
+      dragActive.current = false;
       window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onCancel);
+      window.removeEventListener('blur', onCancel);
       document.body.style.userSelect = '';
 
       if (active) {
-        if (latest) {
+        if (latest && commit) {
+          const el = elements.get(id);
+          if (el) landing.current = { id, rect: el.getBoundingClientRect() };
           begin();
           moveNode(id, latest.parentId, latest.index);
           select(id);
@@ -271,12 +335,55 @@ export function Canvas() {
         }, 0);
       }
       setDraggingId(null);
+      setDragOffset({ x: 0, y: 0 });
+      setShifts(NO_SHIFTS);
       setDrop(null);
     }
 
+    const onUp = () => finish(true);
+    // Cancelling puts everything back rather than committing a drop the user
+    // never released on.
+    const onCancel = () => finish(false);
+
     window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onCancel);
+    window.addEventListener('blur', onCancel);
   }
+
+  // Fly the dropped node from where the finger left it into its new slot.
+  //
+  // The reorder itself is instant — it has to be, the document is the source of
+  // truth — so this measures the gap the commit opened up and plays it back as
+  // motion. Without it the node teleports, and the drag ends by contradicting
+  // the gap the siblings just spent 200ms opening.
+  useLayoutEffect(() => {
+    const pending = landing.current;
+    if (!pending) return;
+    landing.current = null;
+
+    const el = elements.get(pending.id);
+    if (!el) return;
+    const now = el.getBoundingClientRect();
+    const dx = pending.rect.left - now.left;
+    const dy = pending.rect.top - now.top;
+    if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return;
+
+    el.style.transition = 'none';
+    el.style.transform = `translate(${dx}px, ${dy}px)`;
+
+    const id = requestAnimationFrame(() => {
+      el.style.transition = LAND;
+      el.style.transform = '';
+      const clear = () => {
+        el.style.transition = '';
+        el.style.transform = '';
+        el.removeEventListener('transitionend', clear);
+      };
+      el.addEventListener('transitionend', clear);
+    });
+    return () => cancelAnimationFrame(id);
+  });
 
   useEffect(() => {
     if (!playToken || !playNodeId) return;
@@ -327,7 +434,14 @@ export function Canvas() {
             </div>
             <div className="h-[calc(100%-28px)]">
               <Ctx.Provider
-                value={{ register, startDrag, draggingId, suppressClick }}
+                value={{
+                  register,
+                  startDrag,
+                  draggingId,
+                  dragOffset,
+                  shifts,
+                  suppressClick,
+                }}
               >
                 <NodeView node={root} />
               </Ctx.Provider>
@@ -342,9 +456,9 @@ export function Canvas() {
         </div>
       </div>
 
-      {/* Fixed-position so it can be drawn over the phone's rounded clip without
-          being cut off by it, and so it never disturbs the layout it measures. */}
-      {drop && (
+      {/* Only when the target is empty. Everywhere else the gap the siblings
+          opened IS the indicator, and a line on top of it is noise. */}
+      {drop?.empty && (
         <div
           className="pointer-events-none fixed z-50 rounded-full bg-[var(--accent)]"
           style={{
